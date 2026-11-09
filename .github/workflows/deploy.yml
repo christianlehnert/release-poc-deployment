@@ -1,11 +1,12 @@
 name: Deploy
 run-name: "Deploy to '${{ inputs.environment }}', config tag '${{ inputs.config_tag }}', pipeline '${{ github.ref_name }}', started by ${{ github.actor }}"
 
-# plan    reads versions.tfvars from the configuration tag, shows the plan and saves it.
-# apply   waits for the approval of the environment (prod-a, prod-b), then applies exactly the saved plan.
-#         If anything changed in between, Terraform refuses with "Saved plan is stale".
-# promote only after a successful TEST: the release bot opens the pull requests for prod-a and prod-b
-#         with the same versions.tfvars. One release, everything else follows.
+# Full deployment of one environment in one run:
+#   plan     plans all modules (infra, databases, apps) and saves the plans. No approval needed to look.
+#   apply    ONE approval for the environment, then applies exactly the saved plans in order
+#            infra -> databases -> apps. Terraform refuses a plan that is stale.
+#   promote  only after a successful TEST: updates ONE pull request per PROD configuration
+#            ("promote/next") with the versions that ran on TEST. Feature flags are not promoted.
 
 on:
   workflow_dispatch:
@@ -31,6 +32,7 @@ env:
   ENVIRONMENT: ${{ inputs.environment }}
   CONFIG_TAG: ${{ inputs.config_tag }}
   CONFIG_REPO: release-poc-config-${{ inputs.environment }}
+  MODULES: infra databases apps
 
 jobs:
   plan:
@@ -46,7 +48,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get the configuration ${{ inputs.config_tag }}
         run: |
@@ -56,60 +58,80 @@ jobs:
             echo "::error::Tag ${CONFIG_TAG} not found in ${CONFIG_REPO}. Did you create the configuration tag after the merge?"
             exit 1
           fi
-          {
-            echo "### Versions in ${CONFIG_REPO} @ ${CONFIG_TAG}"
-            echo '```'
-            cat cfg/terraform/versions.tfvars
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash scripts/module-inputs.sh cfg inputs "$ENVIRONMENT"
 
       - name: Get the current state of ${{ inputs.environment }}
-        run: |
-          mkdir -p state
-          if git fetch -q --depth 1 origin deploy-state 2>/dev/null \
-             && git show "origin/deploy-state:state/${ENVIRONMENT}.tfstate" > "state/${ENVIRONMENT}.tfstate" 2>/dev/null; then
-            echo "State found."
-          else
-            rm -f "state/${ENVIRONMENT}.tfstate"
-            echo "No state yet: first deployment of ${ENVIRONMENT}."
-          fi
+        run: bash scripts/state.sh get "$ENVIRONMENT"
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
 
-      - name: Terraform plan
+      - name: Terraform plan (all modules)
         id: plan
-        working-directory: terraform
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color -backend-config="path=../state/${ENVIRONMENT}.tfstate" >/dev/null
-          set +e
-          terraform plan -input=false -no-color -detailed-exitcode \
-            -var-file=../cfg/terraform/versions.tfvars -var environment="$ENVIRONMENT" -out=tfplan > plan.txt
-          rc=$?
-          set -e
-          cat plan.txt
-          [ "$rc" -eq 1 ] && exit 1
-          [ "$rc" -eq 2 ] && echo "has_changes=true" >> "$GITHUB_OUTPUT" || echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          mkdir -p plans
+          any=false
           {
-            echo "### Plan for ${ENVIRONMENT}"
-            echo '```'
-            grep -E '^\s+[~+-] |^\s+# |^Plan:|No changes' plan.txt || true
-            echo '```'
+            echo "### Plan for ${ENVIRONMENT} (config ${CONFIG_TAG})"
+            echo ""
+            echo "| Module | Create | Update | Replace | Delete |"
+            echo "|---|---:|---:|---:|---:|"
+          } > summary.md
+          : > changes.md
+          for m in $MODULES; do
+            if [ "$m" = databases ] && [ "$ENVIRONMENT" = prod-b ]; then
+              echo "| databases | skipped: read-only copy in the standby site, migrations only in prod-a | | | |" >> summary.md
+              continue
+            fi
+            ( cd "terraform/$m"
+              terraform init -input=false -no-color -reconfigure -backend-config="path=$GITHUB_WORKSPACE/state/$ENVIRONMENT/$m.tfstate" >/dev/null
+              set +e
+              terraform plan -input=false -no-color -detailed-exitcode -var-file="$GITHUB_WORKSPACE/inputs/$m.json" -out="$GITHUB_WORKSPACE/plans/$m.tfplan" > "$GITHUB_WORKSPACE/plans/$m.txt"
+              echo $? > "$GITHUB_WORKSPACE/plans/$m.rc"
+              set -e
+              terraform show -json "$GITHUB_WORKSPACE/plans/$m.tfplan" > "$GITHUB_WORKSPACE/plans/$m.json"
+            )
+            rc=$(cat "plans/$m.rc")
+            cat "plans/$m.txt"
+            [ "$rc" -eq 1 ] && { echo "::error::Plan of module $m failed"; exit 1; }
+            j="plans/$m.json"
+            c=$(jq '[.resource_changes[]? | select(.change.actions == ["create"])] | length' "$j")
+            u=$(jq '[.resource_changes[]? | select(.change.actions == ["update"])] | length' "$j")
+            r=$(jq '[.resource_changes[]? | select(.change.actions | contains(["delete","create"]))] | length' "$j")
+            d=$(jq '[.resource_changes[]? | select(.change.actions == ["delete"])] | length' "$j")
+            echo "| $m | $c | $u | $r | $d |" >> summary.md
             if [ "$rc" -eq 2 ]; then
-              echo "Only **update in-place** is normal. Create, replace or destroy: stop and find out why."
+              any=true
+              jq -r '.resource_changes[]? | select(.change.actions != ["no-op"])
+                | "- `\(.address)`: \(.change.actions|join("/")) \((.change.before.input.image // .change.before.input.version // "") ) -> \((.change.after.input.image // .change.after.input.version // ""))"' "$j" >> changes.md
+            else
+              rm -f "plans/$m.tfplan"
+            fi
+          done
+          echo "has_changes=$any" >> "$GITHUB_OUTPUT"
+          {
+            cat summary.md
+            echo ""
+            if [ "$any" = true ]; then
+              echo "**What changes**"; echo ""; cat changes.md; echo ""
+              echo "Only **update** is normal for a release. Create, replace or delete: stop and find out why."
+            else
+              echo "No changes."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          cp summary.md changes.md plans/
 
-      - name: Save the plan
+      - name: Save the plans
         if: steps.plan.outputs.has_changes == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: plan-${{ inputs.environment }}
+          name: plans-${{ inputs.environment }}
           path: |
-            terraform/tfplan
-            cfg/terraform/versions.tfvars
+            plans/
+            inputs/
+            cfg/terraform/
           retention-days: 5
 
   apply:
@@ -118,39 +140,38 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Get the current state of ${{ inputs.environment }}
-        run: |
-          mkdir -p state
-          git fetch -q origin deploy-state 2>/dev/null \
-            && git show "origin/deploy-state:state/${ENVIRONMENT}.tfstate" > "state/${ENVIRONMENT}.tfstate" 2>/dev/null \
-            || rm -f "state/${ENVIRONMENT}.tfstate"
-
-      - name: Get the reviewed plan
-        uses: actions/download-artifact@v4
+      - name: Get the reviewed plans
+        uses: actions/download-artifact@v8
         with:
-          name: plan-${{ inputs.environment }}
+          name: plans-${{ inputs.environment }}
           path: saved
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Get the current state of ${{ inputs.environment }}
+        run: bash scripts/state.sh get "$ENVIRONMENT"
+
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
 
-      - name: Terraform apply (exactly the reviewed plan)
-        working-directory: terraform
+      - name: Apply the saved plans in order (infra, databases, apps)
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color -backend-config="path=../state/${ENVIRONMENT}.tfstate" >/dev/null
-          terraform apply -input=false -no-color ../saved/terraform/tfplan
-          {
-            echo "### Running now on ${ENVIRONMENT}"
-            echo '```'
-            terraform output -no-color images
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "### Applied on ${ENVIRONMENT}" >> "$GITHUB_STEP_SUMMARY"
+          for m in $MODULES; do
+            plan="$GITHUB_WORKSPACE/saved/plans/$m.tfplan"
+            if [ ! -f "$plan" ]; then
+              echo "- $m: no changes" >> "$GITHUB_STEP_SUMMARY"; continue
+            fi
+            ( cd "terraform/$m"
+              terraform init -input=false -no-color -reconfigure -backend-config="path=$GITHUB_WORKSPACE/state/$ENVIRONMENT/$m.tfstate" >/dev/null
+              terraform apply -input=false -no-color "$plan" )
+            [ "$m" = databases ] && echo "  (database migrations simulated)"
+            echo "- $m: applied" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Check application health (simulated)
         run: |
@@ -161,49 +182,28 @@ jobs:
           fi
 
       - name: Save the new state
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp "state/${ENVIRONMENT}.tfstate" /tmp/new.tfstate
-          cp saved/cfg/terraform/versions.tfvars /tmp/new.versions.tfvars
-          rm -rf state saved terraform/.terraform terraform/.terraform.lock.hcl
-          if git show-ref -q --verify refs/remotes/origin/deploy-state; then
-            git switch -q -C deploy-state origin/deploy-state
-          else
-            git switch -q --orphan deploy-state
-            git rm -rq --cached . 2>/dev/null || true
-            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          fi
-          mkdir -p state
-          cp /tmp/new.tfstate "state/${ENVIRONMENT}.tfstate"
-          cp /tmp/new.versions.tfvars "state/${ENVIRONMENT}.versions.tfvars"
-          echo "${CONFIG_TAG}" > "state/${ENVIRONMENT}.config_tag"
-          git add state
-          git commit -q -m "${ENVIRONMENT}: ${CONFIG_TAG} (run ${GITHUB_RUN_ID})"
-          for i in 1 2 3 4 5; do
-            git push -q origin deploy-state && exit 0
-            git pull -q --rebase origin deploy-state
-          done
-          echo "::error::Could not save the state." && exit 1
+        run: bash scripts/state.sh put "$ENVIRONMENT" "$CONFIG_TAG" saved/cfg/terraform
 
   promote:
     needs: [plan, apply]
     if: inputs.environment == 'test' && !failure() && !cancelled()
     runs-on: ubuntu-latest
+    concurrency:
+      group: promote
+      cancel-in-progress: false
     steps:
       - name: Get a token for the release bot
         id: bot
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: |
             release-poc-config-prod-a
             release-poc-config-prod-b
 
-      - name: Open the pull requests for prod-a and prod-b
+      - name: Update the pull requests for prod-a and prod-b
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
@@ -213,37 +213,39 @@ jobs:
           set -euo pipefail
           git clone -q --depth 1 --branch "$CONFIG_TAG" "https://github.com/${OWNER}/release-poc-config-test.git" tested
           bot_id=$(gh api "/users/${BOT_SLUG}%5Bbot%5D" -q .id)
+          branch="promote/next"
           echo "### Promote config-test ${CONFIG_TAG}" >> "$GITHUB_STEP_SUMMARY"
           for env in prod-a prod-b; do
             repo="${OWNER}/release-poc-config-${env}"
             rm -rf "$env"
             git clone -q "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" "$env"
             if cmp -s tested/terraform/versions.tfvars "$env/terraform/versions.tfvars"; then
-              echo "- ${env}: already has these versions, no pull request." >> "$GITHUB_STEP_SUMMARY"
+              echo "- ${env}: already has these versions." >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
-            changes=$(diff "$env/terraform/versions.tfvars" tested/terraform/versions.tfvars | grep '^>' | sed 's/^> /- `/; s/$/`/' || true)
-            branch="promote/test-${CONFIG_TAG//\//-}"
-            cp tested/terraform/versions.tfvars "$env/terraform/versions.tfvars"
-            (
-              cd "$env"
+            changes=$(diff "$env/terraform/versions.tfvars" tested/terraform/versions.tfvars | sed -n 's/^> \(.*\)/- `\1`/p' || true)
+            ( cd "$env"
               git config user.name "${BOT_SLUG}[bot]"
               git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
-              git switch -q -c "$branch"
+              git switch -q -C "$branch" origin/main
+              cp ../tested/terraform/versions.tfvars terraform/versions.tfvars
               git commit -q -am "Promote config-test ${CONFIG_TAG}"
-              git push -q --force origin "$branch"
-            )
-            if gh pr view "$branch" --repo "$repo" >/dev/null 2>&1; then
-              url=$(gh pr view "$branch" --repo "$repo" --json url -q .url)
-            else
-              url=$(gh pr create --repo "$repo" --head "$branch" --base main \
-                --title "${env}: promote config-test ${CONFIG_TAG}" \
-                --body "These versions ran successfully on TEST ([run](${RUN_URL}), config-test ${CONFIG_TAG}).
+              git push -q --force origin "$branch" )
+            title="${env}: promote config-test ${CONFIG_TAG}"
+            body="These versions ran successfully on TEST ([run](${RUN_URL}), config-test ${CONFIG_TAG}).
 
-          Changes:
+          Changes compared with ${env} today:
           ${changes}
 
-          After the merge the bot tags this configuration and starts the deployment. The apply waits for the approval of the environment ${env}.")
+          This pull request always holds the newest tested versions: if more releases pass TEST before you merge, the bot updates it. Feature flags (features.tfvars) are not promoted, they stay per environment.
+
+          After the merge the bot tags this configuration and starts the deployment. The apply waits for the approval of the environment ${env}."
+            num=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
+            if [ -n "$num" ]; then
+              gh pr edit "$num" --repo "$repo" --title "$title" --body "$body" >/dev/null
+              url=$(gh pr view "$num" --repo "$repo" --json url -q .url); verb="updated"
+            else
+              url=$(gh pr create --repo "$repo" --head "$branch" --base main --title "$title" --body "$body"); verb="opened"
             fi
-            echo "- ${env}: ${url}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- ${env}: ${verb} ${url}" >> "$GITHUB_STEP_SUMMARY"
           done

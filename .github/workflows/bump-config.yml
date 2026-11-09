@@ -1,0 +1,96 @@
+name: Bump config (reusable)
+
+# Called by every application repository after a release.
+# Writes the new version(s) into ONE collecting pull request in release-poc-config-test
+# (branch bump/next). Ten releases on the same day = one pull request, one TEST deployment.
+# If several repositories release at the same time, the push is retried on the newest branch.
+
+on:
+  workflow_call:
+    inputs:
+      changes:
+        description: 'Lines for versions.tfvars, one per line, for example: app_tag = "release/1.0.3"'
+        type: string
+        required: true
+      source:
+        description: Text for the pull request, for example "release-poc-app release/1.0.3"
+        type: string
+        required: true
+      client-id:
+        type: string
+        required: true
+    secrets:
+      private-key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get a token for the release bot
+        id: bot
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.client-id }}
+          private-key: ${{ secrets.private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: release-poc-config-test
+
+      - name: Write the versions into the collecting pull request
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          OWNER: ${{ github.repository_owner }}
+          CHANGES: ${{ inputs.changes }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          repo="${OWNER}/release-poc-config-test"; branch="bump/next"
+          bot_id=$(gh api "/users/${BOT_SLUG}%5Bbot%5D" -q .id)
+          open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
+          for attempt in 1 2 3 4 5; do
+            rm -rf cfg
+            git clone -q "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" cfg
+            cd cfg
+            git config user.name "${BOT_SLUG}[bot]"
+            git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
+            if [ -n "$open_pr" ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+              git switch -q -c "$branch" "origin/$branch"      # add to the open pull request
+            else
+              git switch -q -c "$branch" origin/main           # start a new collecting pull request
+            fi
+            while IFS= read -r line; do
+              [ -z "${line// }" ] && continue
+              key=$(echo "$line" | sed -E 's/^[[:space:]]*([a-z0-9_]+)[[:space:]]*=.*/\1/')
+              if grep -qE "^${key}[[:space:]]*=" terraform/versions.tfvars; then
+                sed -i -E "s#^${key}[[:space:]]*=.*#${line}#" terraform/versions.tfvars
+              else
+                echo "$line" >> terraform/versions.tfvars
+              fi
+            done <<< "$CHANGES"
+            if git diff --quiet; then echo "Nothing new."; exit 0; fi
+            git commit -q -am "${SOURCE}"
+            if [ -n "$open_pr" ]; then push_args=(); else push_args=(--force); fi
+            if git push -q "${push_args[@]}" origin "$branch"; then break; fi
+            echo "Push rejected (someone else was faster), retry ${attempt}"; cd ..; sleep $((attempt * 3))
+            open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
+          done
+          diffs=$(git diff origin/main -- terraform/versions.tfvars | sed -n 's/^+\([a-z].*\)/- `\1`/p')
+          n=$(echo "$diffs" | grep -c . || true)
+          title="test: ${n} new version(s)"
+          body="Collecting pull request of the release bot. Every release adds its line here, until you merge.
+
+          New compared with TEST today:
+          ${diffs}
+
+          After the merge the bot tags this configuration and deploys it to TEST. If TEST succeeds, the bot updates the pull requests for prod-a and prod-b."
+          if [ -n "$open_pr" ]; then
+            gh pr edit "$open_pr" --repo "$repo" --title "$title" --body "$body" >/dev/null
+            url=$(gh pr view "$open_pr" --repo "$repo" --json url -q .url); verb="updated"
+          else
+            url=$(gh pr create --repo "$repo" --head "$branch" --base main --title "$title" --body "$body"); verb="opened"
+          fi
+          echo "Collecting pull request ${verb}: ${url}" | tee -a "$GITHUB_STEP_SUMMARY"
