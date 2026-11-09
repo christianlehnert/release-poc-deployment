@@ -39,6 +39,7 @@ One run deploys everything that changed: the plan job plans the modules `infra`,
 ## Release branches and features that must not go to PROD yet
 
 - **Release branch:** fixes for PROD go into `releases/x.y` and are released from there. The workflow *Forward-port to main* cherry-picks them onto `main` and opens the pull request by itself (draft with the file names if there is a conflict).
+- **Long-running scope** (months without PROD): develop on `scope/<name>`. Every push deploys a **preview** to TEST (`preview/<branch>-<commit>`, only allowed on test, never promoted). Every push to `main` makes the bot open a pull request that merges `main` into each `scope/**` branch, so the scope keeps the PROD fixes. Chain: `releases/x.y` → `main` → `scope/*`.
 - **Feature flags:** `features.tfvars` lives in every configuration repository and is **not** promoted. A feature can be on in TEST and off in PROD with the same application version.
 
 ## Rollback

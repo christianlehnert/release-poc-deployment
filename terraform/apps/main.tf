@@ -15,8 +15,8 @@ variable "versions" {
   type        = map(string)
   description = "Version per application, for example { app = \"release/1.0.2\" }"
   validation {
-    condition     = alltrue([for v in values(var.versions) : startswith(v, "release/")])
-    error_message = "Only release/* versions are allowed."
+    condition     = alltrue([for v in values(var.versions) : startswith(v, "release/") || (var.environment == "test" && startswith(v, "preview/"))])
+    error_message = "Only release/* versions are allowed (preview/* only on test)."
   }
 }
 
