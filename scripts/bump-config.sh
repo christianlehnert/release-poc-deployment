@@ -39,24 +39,31 @@ if [ "$env" = dev ]; then
 fi
 
 branch="bump/next"
-open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
-for attempt in 1 2 3 4 5; do
+# Never overwrite someone else's lines: build on an open (unmerged) bump/next branch; reset only a branch
+# that is already fully merged, and then only with --force-with-lease. Every push is retried on rejection.
+done_ok=0
+for attempt in 1 2 3 4 5 6; do
   rm -rf "$work/cfg"; git clone -q "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" "$work/cfg"
   cd "$work/cfg"
   git config user.name "${BOT_SLUG}[bot]"; git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
-  if [ -n "$open_pr" ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
-    git switch -q -c "$branch" "origin/$branch"
+  push_args=()
+  if remote_sha=$(git rev-parse -q --verify "origin/$branch"); then
+    if git merge-base --is-ancestor "origin/$branch" origin/main; then
+      git switch -q -c "$branch" origin/main                     # stale (already merged): start fresh
+      push_args=(--force-with-lease="$branch:$remote_sha")
+    else
+      git switch -q -c "$branch" "origin/$branch"                # open work of others: add to it
+    fi
   else
-    git switch -q -c "$branch" origin/main
+    git switch -q -c "$branch" origin/main                       # first one: create it (fails if someone was faster)
   fi
   apply_changes
-  git diff --quiet && { echo "Nothing new."; exit 0; }
+  git diff --quiet && { echo "Nothing new."; done_ok=1; break; }
   git commit -q -am "${source}"
-  if [ -n "$open_pr" ]; then args=(); else args=(--force); fi
-  git push -q "${args[@]}" origin "$branch" && break
-  echo "push rejected, retry ${attempt}"; cd /; sleep $((attempt * 3))
-  open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
+  git push -q "${push_args[@]}" origin "$branch" && { done_ok=1; break; }
+  echo "push rejected (another release was faster), retry ${attempt}"; cd /; sleep $((attempt * 2 + RANDOM % 3))
 done
+[ "$done_ok" = 1 ] || { echo "::error::could not write the collecting pull request after 6 tries"; exit 1; }
 diffs=$(git diff origin/main -- terraform/versions.tfvars | sed -n 's/^+\([a-z].*\)/- `\1`/p')
 n=$(echo "$diffs" | grep -c '_tag' || true)
 title="test: ${n} new version(s)"
@@ -66,10 +73,12 @@ New compared with TEST today:
 ${diffs}
 
 After the merge the bot tags this configuration and deploys it to TEST. If TEST succeeds, the bot updates the pull requests for prod-a and prod-b."
-if [ -n "$open_pr" ]; then
+open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
+if [ -z "$open_pr" ] && url=$(gh pr create --repo "$repo" --head "$branch" --base main --title "$title" --body "$body" 2>/dev/null); then
+  verb=opened
+else
+  open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open --json number -q '.[0].number // empty')
   gh pr edit "$open_pr" --repo "$repo" --title "$title" --body "$body" >/dev/null
   url=$(gh pr view "$open_pr" --repo "$repo" --json url -q .url); verb=updated
-else
-  url=$(gh pr create --repo "$repo" --head "$branch" --base main --title "$title" --body "$body"); verb=opened
 fi
 echo "Collecting pull request ${verb}: ${url}" | tee -a "$summary"
