@@ -75,8 +75,9 @@ jobs:
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             -t "${image}:sha-${GITHUB_SHA}" . >/dev/null
-          docker push -q "${image}:sha-${GITHUB_SHA}" >/dev/null
-          if [ -n "$extra" ]; then docker tag "${image}:sha-${GITHUB_SHA}" "${image}:${extra}"; docker push -q "${image}:${extra}" >/dev/null; fi
+          push() { for i in 1 2 3 4 5; do docker push -q "$1" >/dev/null && return 0; echo "push of $1 refused, retry $i"; sleep $((i * 5)); done; return 1; }
+          push "${image}:sha-${GITHUB_SHA}"
+          if [ -n "$extra" ]; then docker tag "${image}:sha-${GITHUB_SHA}" "${image}:${extra}"; push "${image}:${extra}"; fi
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${image}:sha-${GITHUB_SHA}" | cut -d@ -f2)
           { echo "kind=$kind"; echo "digest=$digest"; echo "short=$short"; echo "branch_slug=$branch_slug"; } >> "$GITHUB_OUTPUT"
           echo "Image ${image}:sha-${GITHUB_SHA} ${extra:+(also :$extra)} digest ${digest}" | tee -a "$GITHUB_STEP_SUMMARY"

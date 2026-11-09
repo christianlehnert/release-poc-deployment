@@ -6,7 +6,7 @@
 # usage: bump-config.sh <dev|test> <changes-file> <source text>
 # env:   GH_TOKEN (bot token), BOT_SLUG, OWNER
 set -euo pipefail
-env=$1 changes=$2 source=$3
+env=$1 changes=$(realpath "$2") source=$3
 repo="${OWNER}/release-poc-config-${env}"
 bot_id=$(gh api "/users/${BOT_SLUG}%5Bbot%5D" -q .id)
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
