@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the input of each Terraform module from the configuration repository.
 #   versions.tfvars:  <name>_tag = "release/x.y.z"     -> apps.versions[<name>]
+#                     <name>_digest = "sha256:..."     -> apps.digests[<name>] (the image built once)
 #                     db_<name>_schema = "x.y.z"       -> databases.schemas[<name>]
 #   features.tfvars:  feature_<name> = true|false      -> apps.features[<name>]
 # usage: module-inputs.sh <config-dir> <out-dir> <environment>
@@ -17,6 +18,12 @@ kv "$cfg/terraform/versions.tfvars" '([a-z0-9_]+)_tag' \
   | awk -F'\t' '{sub(/_tag$/,"",$1); print $1"\t"$2}' \
   | jq -Rn --arg env "$env" '{environment:$env, versions:([inputs|split("\t")|{(.[0]):.[1]}]|add // {})}' \
   > "$out/apps.json"
+
+kv "$cfg/terraform/versions.tfvars" '([a-z0-9_]+)_digest' \
+  | awk -F'\t' '{sub(/_digest$/,"",$1); print $1"\t"$2}' \
+  | jq -Rn '[inputs|split("\t")|{(.[0]):.[1]}]|add // {}' > "$out/digests.json"
+jq --slurpfile d "$out/digests.json" '. + {digests:$d[0]}' "$out/apps.json" > "$out/apps.tmp" && mv "$out/apps.tmp" "$out/apps.json"
+rm -f "$out/digests.json"
 
 kv "$cfg/terraform/versions.tfvars" 'db_([a-z0-9_]+)_schema' \
   | awk -F'\t' '{sub(/^db_/,"",$1); sub(/_schema$/,"",$1); print $1"\t"$2}' \

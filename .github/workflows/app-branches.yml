@@ -1,0 +1,53 @@
+name: App branches (reusable)
+
+# Called by every application repository on pushes to main and releases/** (thin caller branches.yml).
+#   releases/**  cherry-pick the new commits onto main, open the forward-port pull request
+#   main         merge main into every scope/** branch, open or update one pull request per scope
+
+on:
+  workflow_call:
+    inputs:
+      templates-ref:
+        type: string
+        required: true
+      client-id:
+        type: string
+        required: true
+    secrets:
+      private-key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  branches:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get a token for the release bot
+        id: bot
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.client-id }}
+          private-key: ${{ secrets.private-key }}
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.bot.outputs.token }}
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/release-poc-deployment
+          ref: ${{ inputs.templates-ref }}
+          path: .templates
+      - name: Forward-port or sync
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF_NAME" in
+            releases/*) bash .templates/scripts/forward-port.sh "$BEFORE" "$AFTER" "$GITHUB_REF_NAME" ;;
+            main)       bash .templates/scripts/sync-scopes.sh ;;
+          esac

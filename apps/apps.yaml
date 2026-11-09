@@ -1,0 +1,19 @@
+# Central list of application repositories. Drives the release bot, the rollout of new
+# template versions and the baseline check. A new application = one entry here.
+#   repo:  GitHub repository (owner christianlehnert)
+#   name:  key in versions.tfvars (<name>_tag, <name>_digest)
+apps:
+  - repo: release-poc-app
+    name: app
+  - repo: release-poc-ui
+    name: ui
+  - repo: release-poc-worker
+    name: worker
+# Simulated in versions.tfvars only (no repository in the PoC):
+# loader, admin, timeout, gateway, screening, dashboard, recon
+
+# Rules every app repository must follow (checked by the workflow "Baseline check").
+rules:
+  required_check: "ci / quality-gates"
+  min_approvals: 0      # PoC: one person only. In real use: 1, plus code owner review.
+  release_branches: "releases/<major>.<minor>"

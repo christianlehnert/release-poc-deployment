@@ -1,0 +1,60 @@
+name: Roll out templates to all app repositories
+
+# Many repositories, one template: when a new tag of this repository is published, the bot opens one pull
+# request per application repository (apps/apps.yaml) that moves the callers to the new tag.
+# The pull request runs the quality gates of the application before anyone merges it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Template tag to roll out (default: newest release)"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Get a token for the release bot
+        id: bot
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Open one pull request per app repository
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAG" ] || TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          bot_id=$(gh api "/users/${BOT_SLUG}%5Bbot%5D" -q .id)
+          echo "### Rollout of templates ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          for repo in $(yq -r '.apps[].repo' apps/apps.yaml); do
+            rm -rf w && git clone -q "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${repo}.git" w
+            ( cd w
+              git config user.name "${BOT_SLUG}[bot]"; git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
+              branch="templates/${TAG//\//-}"
+              [ -f .github/workflows/ci.yml ] || { echo "- ${repo}: no template callers yet" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+              git switch -q -c "$branch"
+              sed -i -E "s#(release-poc-deployment/\.github/workflows/[a-z-]+\.yml)@release/[0-9.]+#\1@${TAG}#; s#((templates-)?ref:[[:space:]]*)release/[0-9.]+#\1${TAG}#" .github/workflows/*.yml
+              if git diff --quiet; then echo "- ${repo}: already on ${TAG}" >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+              git commit -q -am "Use templates ${TAG}"
+              git push -q --force origin "$branch"
+              num=$(gh pr list --repo "${OWNER}/${repo}" --head "$branch" --state open --json number -q '.[0].number // empty')
+              if [ -z "$num" ]; then
+                url=$(gh pr create --repo "${OWNER}/${repo}" --head "$branch" --base main --title "Use templates ${TAG}" \
+                  --body "Moves the CI, release and branch workflows of this repository to templates ${TAG} of release-poc-deployment. The quality gates below run with the new version before the merge.")
+              else url=$(gh pr view "$num" --repo "${OWNER}/${repo}" --json url -q .url); fi
+              echo "- ${repo}: ${url}" >> "$GITHUB_STEP_SUMMARY" )
+          done

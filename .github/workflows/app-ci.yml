@@ -1,0 +1,125 @@
+name: App CI (reusable)
+
+# Called by every application repository (thin caller .github/workflows/ci.yml).
+#   quality-gates  every pull request and push: shell lint, Dockerfile lint, unit tests, secret scan, image build.
+#                  Required status check "ci / quality-gates" on main in every app repository.
+#   publish        on push: build the image ONCE and push it to ghcr.io (tag sha-<commit>, plus main-<short>
+#                  on main, preview-<branch>-<short> on feature/bugfix/hotfix/scope branches).
+#   deploy-dev     main: the bot writes version and digest into release-poc-config-dev (no review, DEV is for
+#                  fast feedback) -> config tag -> Deploy dev.  feature/bugfix/hotfix/scope: preview on DEV.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Key in versions.tfvars, for example app
+        type: string
+        required: true
+      templates-ref:
+        description: Tag of release-poc-deployment, the same as in the uses line
+        type: string
+        required: true
+      client-id:
+        type: string
+        required: true
+    secrets:
+      private-key:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  quality-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lint shell scripts
+        run: find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r shellcheck
+      - name: Lint Dockerfile
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 < Dockerfile
+      - name: Unit tests
+        run: bash tests/run.sh
+      - name: Secret scan
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.21.2 dir /repo --no-banner --redact
+      - name: Build image (check only)
+        run: docker build -q -t gate-check . >/dev/null && echo "image builds" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: quality-gates
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.push.outputs.kind }}
+      digest: ${{ steps.push.outputs.digest }}
+      short: ${{ steps.push.outputs.short }}
+      branch_slug: ${{ steps.push.outputs.branch_slug }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build once and push to ghcr.io
+        id: push
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          short=${GITHUB_SHA::7}; branch_slug=${GITHUB_REF_NAME//\//-}
+          case "$GITHUB_REF_NAME" in
+            main) kind=main; extra="main-${short}" ;;
+            releases/*) kind=release-branch; extra="" ;;
+            *) kind=preview; extra="preview-${branch_slug}-${short}" ;;
+          esac
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker build -q \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${image}:sha-${GITHUB_SHA}" . >/dev/null
+          docker push -q "${image}:sha-${GITHUB_SHA}" >/dev/null
+          if [ -n "$extra" ]; then docker tag "${image}:sha-${GITHUB_SHA}" "${image}:${extra}"; docker push -q "${image}:${extra}" >/dev/null; fi
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${image}:sha-${GITHUB_SHA}" | cut -d@ -f2)
+          { echo "kind=$kind"; echo "digest=$digest"; echo "short=$short"; echo "branch_slug=$branch_slug"; } >> "$GITHUB_OUTPUT"
+          echo "Image ${image}:sha-${GITHUB_SHA} ${extra:+(also :$extra)} digest ${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    needs: publish
+    if: needs.publish.outputs.kind == 'main' || needs.publish.outputs.kind == 'preview'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get a token for the release bot
+        id: bot
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.client-id }}
+          private-key: ${{ secrets.private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            release-poc-config-dev
+            release-poc-deployment
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/release-poc-deployment
+          ref: ${{ inputs.templates-ref }}
+          path: templates
+      - name: Deploy to DEV
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          OWNER: ${{ github.repository_owner }}
+          APP: ${{ inputs.app-name }}
+          KIND: ${{ needs.publish.outputs.kind }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          SHORT: ${{ needs.publish.outputs.short }}
+          SLUG: ${{ needs.publish.outputs.branch_slug }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = main ]; then
+            printf '%s_tag = "main/%s"\n%s_digest = "%s"\n' "$APP" "$SHORT" "$APP" "$DIGEST" > changes.txt
+            bash templates/scripts/bump-config.sh dev changes.txt "${GITHUB_REPOSITORY#*/} main ${SHORT}"
+          else
+            pipeline_tag=$(gh release view --repo "${OWNER}/release-poc-deployment" --json tagName -q .tagName)
+            config_tag=$(gh release view --repo "${OWNER}/release-poc-config-dev" --json tagName -q .tagName)
+            gh workflow run deploy.yml --repo "${OWNER}/release-poc-deployment" --ref "$pipeline_tag" \
+              -f environment=dev -f config_tag="$config_tag" -f preview="${APP}=preview/${SLUG}-${SHORT}"
+            echo "Preview on DEV: ${APP}=preview/${SLUG}-${SHORT} (config ${config_tag}, pipeline ${pipeline_tag})" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,0 +1,81 @@
+name: App release (reusable)
+
+# Called by every application repository when a release is published (thin caller release.yml).
+# 1. Retag the image that was built for the tagged commit: sha-<commit> -> release-x.y.z. Nothing is rebuilt.
+#    The digest before and after must be identical, otherwise the run fails.
+# 2. The bot writes <app>_tag and <app>_digest into the collecting pull request of release-poc-config-test.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+      templates-ref:
+        type: string
+        required: true
+      client-id:
+        type: string
+        required: true
+    secrets:
+      private-key:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Retag the image (no rebuild) and check the digest
+        id: retag
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha=$(git rev-list -n1 "$TAG")
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          for i in $(seq 1 40); do
+            docker pull -q "${image}:sha-${sha}" >/dev/null 2>&1 && break
+            [ "$i" = 40 ] && { echo "::error::No image for commit ${sha::7}. Was it merged and built (CI green)?"; exit 1; }
+            echo "waiting for the CI build of ${sha::7}..."; sleep 15
+          done
+          before=$(docker inspect --format '{{index .RepoDigests 0}}' "${image}:sha-${sha}" | cut -d@ -f2)
+          new="${image}:release-${TAG#release/}"
+          docker tag "${image}:sha-${sha}" "$new"
+          docker push -q "$new" >/dev/null
+          after=$(docker buildx imagetools inspect "$new" --format '{{json .Manifest}}' | jq -r .digest)
+          if [ "$before" != "$after" ]; then echo "::error::Digest changed: ${before} -> ${after}"; exit 1; fi
+          echo "digest=${after}" >> "$GITHUB_OUTPUT"
+          echo "Release ${TAG}: ${image}:sha-${sha} retagged as release-${TAG#release/}, digest unchanged ${after}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Get a token for the release bot
+        id: bot
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.client-id }}
+          private-key: ${{ secrets.private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: release-poc-config-test
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/release-poc-deployment
+          ref: ${{ inputs.templates-ref }}
+          path: templates
+      - name: Write version and digest into the collecting pull request
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          OWNER: ${{ github.repository_owner }}
+          APP: ${{ inputs.app-name }}
+          TAG: ${{ github.event.release.tag_name }}
+          DIGEST: ${{ steps.retag.outputs.digest }}
+        run: |
+          printf '%s_tag = "%s"\n%s_digest = "%s"\n' "$APP" "$TAG" "$APP" "$DIGEST" > templates-changes.txt
+          bash templates/scripts/bump-config.sh test templates-changes.txt "${GITHUB_REPOSITORY#*/} ${TAG}"

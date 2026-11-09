@@ -7,8 +7,9 @@ run-name: "Deploy to '${{ inputs.environment }}', config tag '${{ inputs.config_
 #            infra -> databases -> apps. Terraform refuses a plan that is stale.
 #   promote  only after a successful TEST: updates ONE pull request per PROD configuration
 #            ("promote/next") with the versions that ran on TEST. Feature flags are not promoted.
-#   preview  optional, TEST only: deploys a build of a feature/scope branch without a release.
-#            A preview is never promoted and is replaced by the next normal TEST deployment.
+#   preview  optional, DEV only: deploys a build of a feature/bugfix/hotfix/scope branch without a release.
+#            A preview is never promoted and is replaced by the next normal DEV deployment.
+# Stages: dev (every merge to main, previews) -> test (release candidates, staging) -> prod-a, prod-b (approval).
 
 on:
   workflow_dispatch:
@@ -16,14 +17,14 @@ on:
       environment:
         description: Environment to deploy
         type: choice
-        options: [test, prod-a, prod-b]
+        options: [dev, test, prod-a, prod-b]
         required: true
       config_tag:
         description: Tag of the configuration repository, for example release/1.0.3
         type: string
         required: true
       preview:
-        description: "TEST only: deploy a branch build without a release, for example app=preview/scope-big-feature-1a2b3c4"
+        description: "DEV only: deploy a branch build without a release, for example app=preview/feature-login-1a2b3c4"
         type: string
         required: false
         default: ""
@@ -51,7 +52,7 @@ jobs:
       - name: Check the pipeline version
         run: |
           echo "Pipeline: ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME} (${GITHUB_SHA::7})" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [ "$ENVIRONMENT" != "test" ] && { [ "$GITHUB_REF_TYPE" != "tag" ] || [[ "$GITHUB_REF_NAME" != release/* ]]; }; then
+          if [[ "$ENVIRONMENT" == prod-* ]] && { [ "$GITHUB_REF_TYPE" != "tag" ] || [[ "$GITHUB_REF_NAME" != release/* ]]; }; then
             echo "::error::${ENVIRONMENT} only from a pipeline tag release/*. Choose the newest tag under 'Use workflow from', not a branch."
             exit 1
           fi
@@ -68,16 +69,16 @@ jobs:
           fi
           bash scripts/module-inputs.sh cfg inputs "$ENVIRONMENT"
           if [ -n "$PREVIEW" ]; then
-            if [ "$ENVIRONMENT" != test ]; then
-              echo "::error::A preview is only allowed on test. PROD gets releases only."; exit 1
+            if [ "$ENVIRONMENT" != dev ]; then
+              echo "::error::A preview is only allowed on dev. TEST and PROD get releases only."; exit 1
             fi
             name=${PREVIEW%%=*} version=${PREVIEW#*=}
             [[ "$version" == preview/* ]] || { echo "::error::Preview version must start with preview/"; exit 1; }
             jq --arg n "$name" --arg v "$version" '.versions[$n] = $v' inputs/apps.json > inputs/a.tmp && mv inputs/a.tmp inputs/apps.json
-            echo "**PREVIEW on TEST:** \`${name}\` = \`${version}\` (not a release, will not be promoted)" >> "$GITHUB_STEP_SUMMARY"
+            echo "**PREVIEW on DEV:** \`${name}\` = \`${version}\` (not a release, will not be promoted)" >> "$GITHUB_STEP_SUMMARY"
           fi
           bad=$(jq -r '.versions | to_entries[] | select(.value | startswith("release/") | not) | "\(.key)=\(.value)"' inputs/apps.json)
-          if [ "$ENVIRONMENT" != test ] && [ -n "$bad" ]; then
+          if [ "$ENVIRONMENT" != dev ] && [ -n "$bad" ]; then
             echo "::error::${ENVIRONMENT} accepts only release/* versions, found: ${bad}"; exit 1
           fi
 

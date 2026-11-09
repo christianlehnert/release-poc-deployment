@@ -1,0 +1,52 @@
+name: Baseline check of all app repositories
+
+# Many repositories drift apart. This check reads every application repository of apps/apps.yaml (read only)
+# and shows in one table whether each follows the same rules. Fails if one does not.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check every app repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          newest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          min=$(yq -r '.rules.min_approvals' apps/apps.yaml)
+          check=$(yq -r '.rules.required_check' apps/apps.yaml)
+          fail=0
+          {
+            echo "### Baseline (templates ${newest})"
+            echo ""
+            echo "| Repository | PR required | approvals >= ${min} | check \`${check}\` | CODEOWNERS | templates | release branches |"
+            echo "|---|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for repo in $(yq -r '.apps[].repo' apps/apps.yaml); do
+            r="${OWNER}/${repo}"
+            rules=$(gh api "repos/${r}/rules/branches/main" 2>/dev/null || echo '[]')
+            pr=$(echo "$rules" | jq -r 'any(.[]; .type=="pull_request")')
+            appr=$(echo "$rules" | jq -r --argjson m "$min" '[.[] | select(.type=="pull_request") | .parameters.required_approving_review_count] | max // -1 | . >= $m')
+            chk=$(echo "$rules" | jq -r --arg c "$check" 'any(.[]; .type=="required_status_checks" and any(.parameters.required_status_checks[]; .context==$c))')
+            owners=false; gh api "repos/${r}/contents/.github/CODEOWNERS" >/dev/null 2>&1 && owners=true
+            pins=$(for f in ci.yml release.yml branches.yml; do gh api "repos/${r}/contents/.github/workflows/${f}" -H 'Accept: application/vnd.github.raw' 2>/dev/null; done \
+              | grep -oE 'release-poc-deployment/\.github/workflows/[a-z-]+\.yml@release/[0-9.]+' | sed 's/.*@//' | sort -u | tr '\n' ' ')
+            [ "${pins% }" = "$newest" ] && tpl=true || tpl=false
+            bad=$(gh api "repos/${r}/branches?per_page=100" -q '[.[].name | select(test("^releases?/") and (test("^releases/[0-9]+\\.[0-9]+$")|not))] | join(" ")')
+            [ -z "$bad" ] && rel=true || rel=false
+            m() { [ "$1" = true ] && echo "yes" || { echo "**no**${2:+ ($2)}"; }; }
+            echo "| ${repo} | $(m $pr) | $(m $appr) | $(m $chk) | $(m $owners) | $(m $tpl "${pins:-none}") | $(m $rel "$bad") |" >> "$GITHUB_STEP_SUMMARY"
+            for v in $pr $appr $chk $owners $tpl $rel; do [ "$v" = true ] || fail=1; done
+          done
+          if [ "$fail" = 1 ]; then echo ""; echo "Not all repositories follow the baseline." | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          echo "All repositories follow the baseline." | tee -a "$GITHUB_STEP_SUMMARY"
